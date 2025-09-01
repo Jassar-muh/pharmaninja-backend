@@ -8,6 +8,13 @@ import { Pinecone } from "@pinecone-database/pinecone";
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
+// --- health + ping endpoints for uptime monitors ---
+app.get("/ping", (req, res) => {
+  res.send("pong");
+});
+app.get("/health", (req, res) => {
+  res.json({ ok: true, uptime: process.uptime(), ts: Date.now() });
+});
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
