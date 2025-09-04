@@ -1,53 +1,26 @@
-// --------- server.js ---------
-import express from "express";
-import fetch from "node-fetch";
-import dotenv from "dotenv";
-import bodyParser from "body-parser";
-import cors from "cors";
-import { Pinecone } from "@pinecone-database/pinecone";
+// server.js
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import fetch from 'node-fetch';
+import { Pinecone } from '@pinecone-database/pinecone';
 
-dotenv.config();
+// ---------- ENV ----------
+const { OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX, PORT } = process.env;
+if (!OPENAI_API_KEY) console.warn('⚠️ Missing OPENAI_API_KEY');
+if (!PINECONE_API_KEY) console.warn('⚠️ Missing PINECONE_API_KEY');
+if (!PINECONE_INDEX) console.warn('⚠️ Missing PINECONE_INDEX');
+
+// ---------- APP ----------
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json({ limit: '1mb' }));
 
-// --- ENV CHECK ---
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
-const PINECONE_INDEX = process.env.PINECONE_INDEX;
+// ---------- PINECONE ----------
+const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
+const index = pc.index(PINECONE_INDEX);
 
-// --- GLOBALS ---
-let pineconeClient, index;
-(async () => {
-  try {
-    pineconeClient = new Pinecone({ apiKey: PINECONE_API_KEY });
-    index = pineconeClient.index(PINECONE_INDEX);
-    console.log("✅ Pinecone index ready:", PINECONE_INDEX);
-  } catch (err) {
-    console.error("❌ Pinecone init failed:", err.message);
-  }
-})();
-
-// --- HELPERS ---
-async function openaiEmb(input) {
-  const r = await fetch("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "text-embedding-3-small",
-      input,
-    }),
-  });
-  if (!r.ok) throw new Error("OpenAI embeddings error " + r.status);
-  const j = await r.json();
-  return j.data[0].embedding;
-}
-
+// ---------- HELPERS ----------
 function buildFilter({ stage, subject }) {
   const f = {};
   if (stage) f.stage = stage;
@@ -55,72 +28,114 @@ function buildFilter({ stage, subject }) {
   return Object.keys(f).length ? f : null;
 }
 
-// --- ROUTES ---
-app.get("/ping", (_req, res) => {
-  res.send("pong");
-});
+async function openaiEmb(text) {
+  const r = await fetch('https://api.openai.com/v1/embeddings', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'text-embedding-3-small', // 1536-dim
+      input: text,
+    }),
+  });
+  if (!r.ok) {
+    throw new Error(`OpenAI embeddings ${r.status}: ${await r.text()}`);
+  }
+  const j = await r.json();
+  return j.data[0].embedding; // Float32Array-like (length 1536)
+}
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), ts: Date.now() });
-});
+async function openaiChat({ lang, question, context }) {
+  // Keep very close to your original “Answer in ${lang}. Use this context…” style
+  const userPrompt =
+`Answer in ${lang || 'EN'}. Use this context if relevant:
 
-app.get("/selftest", async (_req, res) => {
+${context || '(no matches)'}
+
+Q: ${question}
+A:`;
+
+  const r = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a helpful pharmacy study tutor. Keep answers exam-oriented, concise, and do not hallucinate. If unsure, say so.',
+        },
+        { role: 'user', content: userPrompt },
+      ],
+    }),
+  });
+  if (!r.ok) {
+    throw new Error(`OpenAI completion ${r.status}: ${await r.text()}`);
+  }
+  const j = await r.json();
+  return j.choices?.[0]?.message?.content || '(no answer)';
+}
+
+// ---------- HEALTH ----------
+app.get('/ping', (_req, res) => res.send('pong'));
+
+app.get('/health', async (_req, res) => {
   try {
-    // env check
-    const env = {
-      OPENAI_API_KEY: !!OPENAI_API_KEY,
-      PINECONE_API_KEY: !!PINECONE_API_KEY,
-      PINECONE_INDEX: PINECONE_INDEX || "(missing)",
-    };
-
-    // test embedding
-    let embDim = 0;
-    try {
-      const vec = await openaiEmb("hello");
-      embDim = vec.length;
-    } catch (e) {
-      return res.status(500).json({ error: "Embedding failed", detail: e.message });
-    }
-
-    // test pinecone
-    let pineRes;
-    try {
-      pineRes = await index.query({
-        vector: new Array(1536).fill(0),
-        topK: 1,
-      });
-    } catch (e) {
-      return res.status(500).json({ error: "Pinecone failed", detail: e.message });
-    }
-
-    res.json({
-      env,
-      openai: { ok: embDim > 0, dim: embDim },
-      pinecone: { ok: true, matches: pineRes?.matches?.length || 0 },
-    });
+    // quick light checks
+    res.json({ ok: true, uptime: process.uptime(), ts: Date.now() });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// -------- MAIN QUERY --------
-app.post("/query", async (req, res) => {
+app.get('/selftest', async (_req, res) => {
   try {
-    const { lang = "EN", stage, subject, question } = req.body || {};
-    if (!question || typeof question !== "string" || !question.trim()) {
-      return res.status(400).json({ error: "Missing question" });
+    // embed + pinecone round-trip to verify config
+    const emb = await openaiEmb('selftest');
+    let pineOk = false;
+    let matches = 0;
+    try {
+      const pineRes = await index.query({ vector: emb, topK: 1 });
+      pineOk = true;
+      matches = pineRes?.matches?.length || 0;
+    } catch (e) {
+      pineOk = false;
+    }
+    res.json({
+      env: {
+        OPENAI_API_KEY: !!OPENAI_API_KEY,
+        PINECONE_API_KEY: !!PINECONE_API_KEY,
+        PINECONE_INDEX,
+      },
+      openai: { ok: emb?.length === 1536, dim: emb?.length || 0 },
+      pinecone: { ok: pineOk, matches },
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Embedding failed', detail: e.message });
+  }
+});
+
+// ---------- MAIN QUERY ----------
+app.post('/query', async (req, res) => {
+  try {
+    const { lang = 'EN', stage, subject, question } = req.body || {};
+    if (!question || typeof question !== 'string' || !question.trim()) {
+      return res.status(400).json({ error: 'Missing question' });
     }
     if (!OPENAI_API_KEY || !PINECONE_API_KEY || !PINECONE_INDEX) {
-      return res.status(500).json({ error: "Missing env vars" });
-    }
-    if (!index) {
-      return res.status(500).json({ error: "Pinecone index not ready" });
+      return res.status(500).json({ error: 'Missing env vars' });
     }
 
-    // 1. Embed question
+    // 1) Embed question
     const qVec = await openaiEmb(question);
 
-    // 2. Search Pinecone
+    // 2) Pinecone search with optional filter
     const filter = buildFilter({ stage, subject });
     const pine = await index.query({
       vector: qVec,
@@ -131,44 +146,27 @@ app.post("/query", async (req, res) => {
 
     const matches = pine?.matches || [];
     const context = matches
-      .map((m, i) => `[#${i + 1}] ${m?.metadata?.text || ""}`)
-      .join("\n");
+      .map((m, i) => `[#${i + 1}] ${m?.metadata?.text || ''}`)
+      .join('\n');
 
-    // 3. Ask OpenAI completion
-    const prompt = `Answer in ${lang}. Use this context:\n${context}\n\nQ: ${question}\nA:`;
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    if (!r.ok) {
-      const txt = await r.text().catch(() => "");
-      throw new Error("OpenAI completion error: " + r.status + " " + txt);
-    }
-    const j = await r.json();
-    const answer = j.choices?.[0]?.message?.content || "(no answer)";
+    // 3) Generate answer
+    const answer = await openaiChat({ lang, question, context });
 
-    res.json({
+    // 4) Return with compact source list
+    return res.json({
       answer,
-      sources: matches.map((m) => ({
+      sources: matches.map(m => ({
         id: m.id,
         score: m.score,
         file: m?.metadata?.file,
       })),
     });
   } catch (e) {
-    console.error("QUERY ERROR:", e.message);
-    res.status(500).json({ error: "Query failed", detail: e.message });
+    console.error('QUERY ERROR:', e.message);
+    return res.status(500).json({ error: 'Query failed', detail: e.message });
   }
 });
 
-// --- START SERVER ---
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+// ---------- START ----------
+const port = Number(PORT) || 3000;
+app.listen(port, () => console.log(`✅ API running on :${port}`));
