@@ -1,392 +1,441 @@
-// server.js
-// Pharmaninja backend — ready to paste
-// Requires: OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX
-// Optional: PORT (default 3000)
+// server.js (PharmaNinja Backend) — 2025-09-09
 
-import express from 'express';
-import cors from 'cors';
-import fetch from 'node-fetch';
-import dotenv from 'dotenv';
-dotenv.config();
+// -------------------------
+// Imports & basic setup
+// -------------------------
+const express = require('express');
+const cors = require('cors');
+const https = require('https');
 
-const PORT = process.env.PORT || 3000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
-const PINECONE_INDEX = process.env.PINECONE_INDEX;
-
-// --- Guard env ---
-if (!OPENAI_API_KEY) console.warn('WARN: OPENAI_API_KEY missing');
-if (!PINECONE_API_KEY) console.warn('WARN: PINECONE_API_KEY missing');
-if (!PINECONE_INDEX) console.warn('WARN: PINECONE_INDEX missing');
-
-// --- OpenAI endpoints ---
-const OA_CHAT_URL = 'https://api.openai.com/v1/chat/completions';
-const OA_EMB_URL  = 'https://api.openai.com/v1/embeddings';
-// Models (embedding dim 1536)
-const CHAT_MODEL  = 'gpt-4o-mini';
-const EMB_MODEL   = 'text-embedding-3-small';
-
-// --- Pinecone endpoints ---
-const PC_HOST = `https://${PINECONE_INDEX}.svc.${inferPineconeEnv()}.pinecone.io`;
-// If you know your environment (e.g., "gcp-starter"), hardcode it above for speed
-
-// --- Tiny in-memory session store ---
-const SESS = new Map();
-/*
-  Session shape:
-  {
-    lang: 'EN'|'AR',
-    stage: '3rd' | ...,
-    subject: 'Pharmacology' | ...,
-    topic: 'string | null',
-    history: [ {role:'user'|'assistant', content:'...'} ] (short)
-  }
-*/
+let fetchFn = global.fetch;
+try {
+  if (!fetchFn) fetchFn = require('node-fetch');
+} catch (_) {
+  // Node 18+ has global.fetch; ignore if node-fetch not present
+}
+const fetch = (...args) => fetchFn(...args);
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
-// ---------- Utilities ----------
-function normalizeLang(x) {
-  if (!x) return null;
-  const t = String(x).trim().toUpperCase();
-  if (['EN','ENGLISH'].includes(t)) return 'EN';
-  if (['AR','ARABIC','ع','عربي','العربية'].includes(t)) return 'AR';
-  return null;
-}
+// -------------------------
+// Config & constants
+// -------------------------
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const PINECONE_API_KEY = process.env.PINECONE_API_KEY || '';
+const PINECONE_INDEX = process.env.PINECONE_INDEX || 'pharmaninja-bot-1536';
+// If you know your fixed host, you can set PINECONE_HOST in Render env.
+// Else we infer from index name on GCP starter tier:
+const PINECONE_HOST = process.env.PINECONE_HOST || `${PINECONE_INDEX}.svc.gcp-starter.pinecone.io`;
 
-function ensureSession(id) {
-  if (!SESS.has(id)) SESS.set(id, { lang: 'EN', stage: null, subject: null, topic: null, history: [] });
-  return SESS.get(id);
-}
+const PORT = process.env.PORT || 3000;
 
-function shortPushHistory(s, turn) {
-  s.history.push(turn);
-  // keep last ~6 turns (user+assistant pairs)
-  if (s.history.length > 12) s.history.splice(0, s.history.length - 12);
-}
+// Use the 1536-dimensional embedding model to match your index
+const EMBEDDING_MODEL = 'text-embedding-3-small'; // 1536 dims
 
-function buildFilter(s) {
-  const f = {};
-  if (s.stage) f.stage = s.stage;
-  if (s.subject) f.subject = s.subject;
-  // NOTE: we do NOT force lang in the filter — mixed language PDFs can still be useful
-  return Object.keys(f).length ? f : null;
-}
+// A very small rolling memory per session to help follow-ups.
+// If you want persistence across restarts, swap this for Redis.
+const SESSIONS = new Map(); // sessionId -> { lang, stage, subject, pinnedTopic, history: [{role, content}], ts }
 
-function languageGuardText(lang) {
-  return (lang === 'AR')
-    ? 'أجب باللغة العربية فقط. لا تستخدم أي لغة أخرى على الإطلاق.'
-    : 'Answer ONLY in English. Do not use any other language.';
-}
+// Keep sockets alive & force IPv4 to avoid TLS/IPv6 edge cases
+const agentV4 = new https.Agent({
+  keepAlive: true,
+  maxSockets: 50,
+  timeout: 30000,
+  family: 4
+});
 
-function prefsLine(s, lang) {
-  if (lang === 'AR') {
-    const parts = [];
-    if (s.stage) parts.push(`المرحلة: ${s.stage}`);
-    if (s.subject) parts.push(`المادة: ${s.subject}`);
-    return parts.length ? `تفضيلات المستخدم: ${parts.join(' | ')}` : 'تفضيلات المستخدم: (غير محددة)';
+// -------------------------
+// Helpers
+// -------------------------
+
+function getOrInitSession(sessionId) {
+  let s = SESSIONS.get(sessionId);
+  if (!s) {
+    s = {
+      lang: 'EN',
+      stage: null,
+      subject: null,
+      pinnedTopic: null,
+      history: [], // last 10 user/assistant messages
+      ts: Date.now()
+    };
+    SESSIONS.set(sessionId, s);
   }
-  const parts = [];
-  if (s.stage) parts.push(`Stage: ${s.stage}`);
-  if (s.subject) parts.push(`Subject: ${s.subject}`);
-  return parts.length ? `User prefs: ${parts.join(' | ')}` : 'User prefs: (not set)';
+  return s;
 }
 
-function topicLine(s, lang) {
-  if (!s.topic) return (lang === 'AR') ? 'الموضوع المثبّت: (لا يوجد)' : 'Pinned topic: (none)';
-  return (lang === 'AR') ? `الموضوع المثبّت: ${s.topic}` : `Pinned topic: ${s.topic}`;
-}
-
-function histBlockText(s, lang) {
-  if (!s.history?.length) return (lang === 'AR') ? 'تاريخ المحادثة: (لا يوجد)' : 'Conversation history: (none)';
-  const lastFew = s.history.slice(-6);
-  const asText = lastFew.map(h => `${h.role === 'user' ? (lang==='AR'?'المستخدم':'User') : (lang==='AR'?'المساعد':'Assistant')}: ${h.content}`).join('\n');
-  return (lang === 'AR') ? `تاريخ المحادثة (الأحدث أولاً):\n${asText}` : `Conversation history (newest last):\n${asText}`;
-}
-
-function detectArabicSwitch(q) {
-  // if user just says "arabic" (case-insensitive) switch to AR
-  return /^\s*arabic\s*$/i.test(q);
-}
-function detectEnglishSwitch(q) {
-  // if user just says "english"
-  return /^\s*english\s*$/i.test(q);
+function pushHistory(session, role, content) {
+  session.history.push({ role, content: String(content || '').slice(0, 2000) });
+  if (session.history.length > 10) session.history = session.history.slice(-10);
+  session.ts = Date.now();
 }
 
 function detectMCQ(q, lang) {
-  if (lang === 'AR') {
-    return /(\bMCQ\b|اختيار|اختر|أسئلة اختيار|اختيار من متعدد)/i.test(q);
-  }
-  return /\b(MCQ|MCQs|multiple[-\s]?choice)\b/i.test(q);
+  const t = (q || '').toLowerCase();
+  if (/mcq/.test(t) || /multiple[- ]?choice/.test(t)) return true;
+  if (lang === 'AR' && /(اختيار|متعدد|أسئلة|mcq)/i.test(q)) return true;
+  return false;
 }
 
-function detectCompare(q, lang) {
-  if (lang === 'AR') return /(قارن|مقارنة)/i.test(q);
-  return /\b(compare|vs\.?)\b/i.test(q);
+function cleanSources(matches) {
+  return (matches || [])
+    .slice(0, 5)
+    .map(m => {
+      const id = m?.id || '';
+      const file = m?.metadata?.file || m?.metadata?.source || id;
+      return { id, file, score: m?.score ?? undefined };
+    });
 }
 
-function rewriteCompare(q, lang, s) {
-  // Try to capture the other target (e.g., "compare with glycopeptides")
-  let other = null;
-  if (lang === 'AR') {
-    const m = q.match(/(?:قارن(?:\s+بين)?|مقارنة(?:\s+بين)?)\s+(.*)$/i);
-    if (m && m[1]) other = m[1].trim();
-  } else {
-    const m = q.match(/compare(?:\s+with|\s+to)?\s+(.*)$/i);
-    if (m && m[1]) other = m[1].trim();
-  }
-  const pinned = s.topic || null;
-  if (pinned && other) {
-    return (lang === 'AR')
-      ? `قدّم مقارنة موجزة ومنظمة بين "${pinned}" و "${other}". ركّز على آلية العمل، الطيف، الاستطبابات، الآثار الجانبية، والمقاومة.`
-      : `Provide a concise, structured comparison between "${pinned}" and "${other}". Focus on MoA, spectrum, indications, adverse effects, and resistance.`;
-  }
-  // fall back: ask for both sides clearly
-  return (lang === 'AR')
-    ? `أعد صياغة السؤال: مقارنة، ولكن حدّد الطرفين بوضوح.`
-    : `Rewrite as a comparison, but clearly specify both sides.`;
+// Simple topic extraction (cheap heuristic): first title-ish sentence of the first assistant answer
+function extractTopic(text) {
+  if (!text) return null;
+  const firstLine = text.split('\n').find(l => l.trim().length > 0) || '';
+  // strip markdown headers and bold
+  const t = firstLine.replace(/^#+\s*/, '').replace(/\*\*|__/g, '').trim();
+  if (t.length >= 6 && t.length <= 120) return t;
+  // fallback: first 10 words
+  return text.split(/\s+/).slice(0, 10).join(' ');
 }
 
-function mcqHintText(lang) {
-  return (lang === 'AR')
-    ? 'إذا كان السؤال يطلب MCQs، اصنع 5 أسئلة MCQ مع الإجابات النموذجية والنقطة التعليمية بعد كل سؤال.'
-    : 'If the user asks for MCQs, produce 5 exam-style MCQs with correct answers and a one-line learning point after each.';
-}
+// -------------------------
+// OpenAI calls
+// -------------------------
 
-// ---------- RAG (Pinecone) ----------
-async function embedQuery(text) {
-  const r = await fetch(OA_EMB_URL, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({ model: EMB_MODEL, input: text })
-  });
-  if (!r.ok) throw new Error(`OpenAI Embeddings ${r.status}: ${await r.text()}`);
-  const j = await r.json();
-  const v = j?.data?.[0]?.embedding;
-  if (!v) throw new Error('No embedding returned');
-  return v;
-}
-
-async function pineconeQuery({ vector, topK = 6, filter = null, includeMetadata = true }) {
-  const url = `${PC_HOST}/query`;
-  const body = {
-    vector,
-    topK,
-    includeMetadata,
-  };
-  if (filter && Object.keys(filter).length) body.filter = filter;
-
+async function embedTexts(texts) {
+  const url = 'https://api.openai.com/v1/embeddings';
+  const body = { model: EMBEDDING_MODEL, input: texts };
   const r = await fetch(url, {
     method: 'POST',
     headers: {
-      'Content-Type':'application/json',
-      'Api-Key': PINECONE_API_KEY
+      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    agent: agentV4
   });
-  if (!r.ok) throw new Error(`Pinecone ${r.status}: ${await r.text()}`);
-  const j = await r.json();
-  return j?.matches || [];
-}
-
-function renderContextFromMatches(matches, lang) {
-  if (!matches?.length) return '';
-  const lines = matches.map((m, i)=> {
-    const meta = m.metadata || {};
-    const src = meta.file || meta.id || `doc-${i+1}`;
-    const chunk = (meta.text || meta.content || '').slice(0, 1200);
-    return `[${i+1}] Source: ${src}\n${chunk}`;
-  });
-  return lines.join('\n\n');
-}
-
-function collectSources(matches) {
-  return (matches || []).map((m, i)=> {
-    const meta = m.metadata || {};
-    return {
-      id: meta.id || meta.file || `doc-${i+1}`,
-      file: meta.file || undefined,
-      score: typeof m.score === 'number' ? m.score : undefined
-    };
-  });
-}
-
-// ---------- OpenAI Chat ----------
-async function chatComplete(messages, lang) {
-  const r = await fetch(OA_CHAT_URL, {
-    method: 'POST',
-    headers: { 'Content-Type':'application/json', 'Authorization': `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({
-      model: CHAT_MODEL,
-      temperature: 0.3,
-      messages
-    })
-  });
-  if (!r.ok) throw new Error(`OpenAI Chat ${r.status}: ${await r.text()}`);
-  const j = await r.json();
-  return j?.choices?.[0]?.message?.content || (lang==='AR' ? 'عذرًا، حدث خطأ.' : 'Sorry, something went wrong.');
-}
-
-// ---------- Routes ----------
-app.get('/ping', (_req, res)=> res.type('text').send('pong'));
-
-app.get('/health', async (_req, res) => {
-  res.json({ ok: true, uptime: process.uptime()*1000, ts: Date.now() });
-});
-
-app.get('/selftest', async (_req, res) => {
-  const env = {
-    OPENAI_API_KEY: !!OPENAI_API_KEY,
-    PINECONE_API_KEY: !!PINECONE_API_KEY,
-    PINECONE_INDEX: PINECONE_INDEX || null
-  };
-  // very light smoke checks
-  let openai = { ok: false, dim: null };
-  try {
-    const v = await embedQuery('ping');
-    openai = { ok: true, dim: v.length };
-  } catch(e) { openai = { ok: false, err: String(e.message).slice(0,180) }; }
-
-  let pinecone = { ok: false, matches: null };
-  try {
-    const v = await embedQuery('ping pinecone');
-    const f = null; // no filter for smoke
-    const matches = await pineconeQuery({ vector: v, topK: 1, filter: f });
-    pinecone = { ok: true, matches: matches.length };
-  } catch(e) { pinecone = { ok: false, err: String(e.message).slice(0,180) }; }
-
-  res.json({ env, openai, pinecone });
-});
-
-app.post('/query', async (req, res) => {
-  try {
-    const { sessionId, question: rawQ, lang: bodyLang, stage, subject } = req.body || {};
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
-
-    const q = (String(rawQ || '')).trim();
-    const s = ensureSession(sessionId);
-
-    // Persist prefs if provided this turn
-    const langFromBody = normalizeLang(bodyLang);
-    if (langFromBody) s.lang = langFromBody;
-    if (stage) s.stage = stage;
-    if (subject) s.subject = subject;
-
-    // Language switch shortcuts
-    if (detectArabicSwitch(q)) {
-      s.lang = 'AR';
-      return res.json({ answer: 'تم! اكتب سؤالك الآن بالعربية.', sources: [], debug: { lang: s.lang, switched: true }});
-    }
-    if (detectEnglishSwitch(q)) {
-      s.lang = 'EN';
-      return res.json({ answer: 'Done! Ask your question in English.', sources: [], debug: { lang: s.lang, switched: true }});
-    }
-
-    // Language (locked)
-    const lang = s.lang || 'EN';
-
-    // Topic pinning: if first turn or explicit "explain ..." treat as topic setter
-    // (only pin if user asks an informative question)
-    const isFirstTopicLike = !s.topic && q.length >= 8;
-    if (isFirstTopicLike) {
-      // Pin a short topic label (first 8 words)
-      s.topic = (q.split(/\s+/).slice(0, 8).join(' ')).trim();
-    }
-
-    // If compare asked, rewrite to include pinned topic (if any)
-    let rewrittenQuestion = q;
-    const isCompare = detectCompare(q, lang);
-    if (isCompare) {
-      rewrittenQuestion = rewriteCompare(q, lang, s);
-    }
-
-    // Build Pinecone filter safely (optional)
-    const filter = buildFilter(s);
-
-    // Embed and retrieve
-    const emb = await embedQuery(rewrittenQuestion);
-    const matches = await pineconeQuery({ vector: emb, topK: 6, filter });
-
-    const context = renderContextFromMatches(matches, lang);
-    const sources = collectSources(matches);
-
-    // MCQ hint if requested
-    const wantsMCQ = detectMCQ(q, lang);
-    const mcqHint = wantsMCQ ? (lang==='AR'
-        ? 'اصنع 5 أسئلة اختيار من متعدد (MCQ) مع الإجابة الصحيحة وتفسير سطر واحد لكل سؤال.'
-        : 'Create 5 multiple-choice questions (MCQs) with the correct answer and a one-line explanation for each.'
-      ) : '';
-
-    // Language guard first, then system behavior
-    const languageGuard = languageGuardText(lang);
-
-    const sys = (lang === 'AR')
-      ? 'أنت مساعد دراسي مختصر وعملي لطلاب الصيدلة. قدّم إجابات موجزة، منظمة، ومناسبة للامتحانات.'
-      : 'You are a concise, exam-oriented pharmacy tutor. Give succinct, structured answers.';
-
-    const prefs = prefsLine(s, lang);
-    const topicLn = topicLine(s, lang);
-    const histBlock = histBlockText(s, lang);
-    const ctxLabel = (lang === 'AR') ? 'السياق' : 'Context';
-    const qLabel   = (lang === 'AR') ? 'السؤال' : 'Question';
-
-    const userContent =
-`Answer language: ${lang}
-${prefs}
-${topicLn}
-${histBlock}
-
-${ctxLabel}:
-${context || (lang === 'AR' ? '(لا سياق متاح)' : '(no context available)')}
-
-${qLabel}: ${rewrittenQuestion}
-
-${mcqHint}
-`;
-
-    const messages = [
-      { role: 'system', content: languageGuard },
-      { role: 'system', content: sys },
-      { role: 'user', content: userContent }
-    ];
-
-    const answer = await chatComplete(messages, lang);
-
-    // Update history + refine topic if needed
-    shortPushHistory(s, { role: 'user', content: q });
-    shortPushHistory(s, { role: 'assistant', content: answer });
-    // Topic refinement: if we didn't have one but the model clearly summarized a subject line, keep the initial pin
-
-    return res.json({
-      answer,
-      sources: sources.slice(0, 5),
-      debug: {
-        lang,
-        stage: s.stage || null,
-        subject: s.subject || null,
-        topic: s.topic || null,
-        rewrittenQuestion,
-        filterUsed: filter || '(none)',
-        hits: matches.length
-      }
-    });
-  } catch (e) {
-    console.error('ERROR /query:', e);
-    return res.status(500).json({ error: 'Query failed', detail: String(e.message).slice(0, 300) });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error(`OpenAI embeddings ${r.status}: ${txt}`);
   }
-});
-
-// ---------- Start ----------
-app.listen(PORT, () => {
-  console.log(`Pharmaninja backend listening on :${PORT}`);
-});
-
-// ---------- Helpers ----------
-function inferPineconeEnv() {
-  // If you know your env (e.g., 'gcp-starter'), hardcode it:
-  // return 'gcp-starter';
-  // Else default to 'gcp-starter' (common in tutorials). Adjust if needed.
-  return 'gcp-starter';
+  const json = await r.json();
+  const vectors = (json?.data || []).map(d => d.embedding);
+  return vectors;
 }
+
+async function chatComplete(systemPrompt, messages, lang) {
+  // Use a modern gpt model name if you have access; fallback to gpt-4o-mini/4.1-mini style
+  const url = 'https://api.openai.com/v1/chat/completions';
+  const body = {
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      ...messages
+    ]
+  };
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body),
+    agent: agentV4
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error(`OpenAI chat ${r.status}: ${txt}`);
+  }
+  const json = await r.json();
+  const text = json?.choices?.[0]?.message?.content || '';
+  return text;
+}
+
+// -------------------------
+// Pinecone
+// -------------------------
+
+async function pineconeQuerySafe({ indexHost, namespace, vector, topK = 8, filter = {} }, tries = 3) {
+  if (!indexHost) throw new Error('Missing Pinecone host');
+  const url = `https://${indexHost}/query`;
+
+  const finalFilter = (filter && typeof filter === 'object' && Object.keys(filter).length)
+    ? filter
+    : undefined; // IMPORTANT: undefined if empty so Pinecone doesn't error
+
+  const body = {
+    vector,
+    topK,
+    includeMetadata: true,
+    includeValues: false,
+    namespace: namespace || undefined,
+    filter: finalFilter
+  };
+
+  let lastErr;
+  for (let i = 1; i <= tries; i++) {
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Api-Key': PINECONE_API_KEY
+        },
+        body: JSON.stringify(body),
+        agent: agentV4
+      });
+      if (!r.ok) {
+        const txt = await r.text().catch(() => '');
+        if ([408, 425, 429, 500, 502, 503, 504].includes(r.status) && i < tries) {
+          await new Promise(res => setTimeout(res, 500 * i));
+          continue;
+        }
+        throw new Error(`Pinecone ${r.status}: ${txt}`);
+      }
+      const json = await r.json();
+      return json;
+    } catch (e) {
+      lastErr = e;
+      if (i < tries) {
+        await new Promise(res => setTimeout(res, 600 * i));
+        continue;
+      }
+    }
+  }
+  throw lastErr || new Error('Pinecone query failed');
+}
+
+// -------------------------
+// Health endpoints
+// -------------------------
+app.get('/ping', (req, res) => res.send('pong'));
+
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    uptime: process.uptime(),
+    ts: Date.now()
+  });
+});
+
+app.get('/selftest', async (req, res) => {
+  const out = {
+    env: {
+      OPENAI_API_KEY: !!OPENAI_API_KEY,
+      PINECONE_API_KEY: !!PINECONE_API_KEY,
+      PINECONE_INDEX
+    },
+    openai: {},
+    pinecone: {}
+  };
+  try {
+    const [vec] = await embedTexts(['hello world']);
+    out.openai.ok = Array.isArray(vec) && vec.length > 0;
+    out.openai.dim = Array.isArray(vec) ? vec.length : 0;
+  } catch (e) {
+    out.openai.ok = false;
+    out.openai.note = String(e.message || e);
+  }
+
+  try {
+    const probe = await pineconeQuerySafe({
+      indexHost: PINECONE_HOST,
+      namespace: undefined,
+      vector: new Array(1536).fill(0),
+      topK: 1,
+      filter: { probe: true } // likely no results; just ensures call works
+    });
+    out.pinecone.ok = true;
+    out.pinecone.note = `topK=${(probe?.matches || []).length}`;
+  } catch (e) {
+    out.pinecone.ok = false;
+    out.pinecone.note = String(e.message || e);
+  }
+
+  res.json(out);
+});
+
+// -------------------------
+// Main query endpoint
+// -------------------------
+app.post('/query', async (req, res) => {
+  const {
+    sessionId: rawSessionId,
+    lang: langIn,
+    stage: stageIn,
+    subject: subjectIn,
+    question: rawQuestion
+  } = req.body || {};
+
+  const sessionId = (rawSessionId || '').trim() || `${req.ip}:${Date.now()}`;
+  const session = getOrInitSession(sessionId);
+
+  // Merge preferences if provided
+  if (langIn) session.lang = (langIn || '').toUpperCase() === 'AR' ? 'AR' : 'EN';
+  if (stageIn) session.stage = String(stageIn || '');
+  if (subjectIn) session.subject = String(subjectIn || '');
+
+  // Safe message text
+  const question = String(rawQuestion || '').trim();
+
+  // Language toggle by keyword
+  if (/^\s*arabic\s*$/i.test(question)) {
+    session.lang = 'AR';
+    pushHistory(session, 'user', question);
+    return res.json({ answer: 'تم! اكتب سؤالك الآن بالعربية.', sources: [] });
+  }
+  if (/^\s*english\s*$/i.test(question)) {
+    session.lang = 'EN';
+    pushHistory(session, 'user', question);
+    return res.json({ answer: 'Done! Ask your question in English.', sources: [] });
+  }
+
+  const lang = session.lang;
+  const stage = session.stage;
+  const subject = session.subject;
+
+  // If no question, nudge
+  if (!question) {
+    return res.json({
+      answer: lang === 'AR' ? 'اكتب سؤالك.' : 'Ask your question.',
+      sources: []
+    });
+  }
+
+  // Remember user question
+  pushHistory(session, 'user', question);
+
+  // Create embedding for retrieval
+  let embed;
+  try {
+    [embed] = await embedTexts([question]);
+  } catch (e) {
+    return res.status(500).json({ error: 'Embedding failed', detail: String(e.message || e) });
+  }
+
+  // Pinecone query with safe retries + graceful fallback
+  const needMCQs = detectMCQ(question, lang);
+  let matches = [];
+  let pineconeError = null;
+
+  try {
+    const namespace =
+      (lang || stage || subject) ? `${(lang || '').trim()}::${(stage || '').trim()}::${(subject || '').trim()}` : undefined;
+
+    const filter = {};
+    if (lang) filter.lang = lang;
+    if (stage) filter.stage = stage;
+    if (subject) filter.subject = subject;
+
+    const pcResp = await pineconeQuerySafe({
+      indexHost: PINECONE_HOST,
+      namespace,
+      vector: embed,
+      topK: needMCQs ? 12 : 8,
+      filter
+    });
+
+    matches = (pcResp?.matches || []).filter(m => m?.metadata);
+  } catch (err) {
+    pineconeError = String(err && err.message || err);
+    console.warn('Pinecone fallback -> using empty context:', pineconeError);
+    matches = [];
+  }
+
+  // Build context text from matches (caps at ~2-3k chars)
+  let contextText = '';
+  for (const m of matches) {
+    const chunk = m?.metadata?.text || m?.metadata?.chunk || '';
+    if (!chunk) continue;
+    if ((contextText + '\n\n' + chunk).length > 2800) break;
+    contextText += (contextText ? '\n\n' : '') + chunk;
+  }
+
+  // Small “no context” hint to steer the model
+  const noContextHint = matches.length === 0
+    ? (lang === 'AR'
+      ? '⚠️ لا يوجد سياق مسترجع الآن. أجب بإيجاز واذكر أن المصادر غير متاحة.'
+      : '⚠️ No retrieved context right now. Answer briefly and note that sources are unavailable.')
+    : '';
+
+  // System prompt (personality + guardrails)
+  const sys = (lang === 'AR')
+    ? [
+        'أنت مساعد دراسي لطلاب الصيدلة. أجب بإيجاز وبأسلوب امتحاني.',
+        'استخدم خطوات منظمة وعناوين فرعية عند الحاجة.',
+        'إن طُلب MCQs، قدم أسئلة بخيارات وإجابة نموذجية، مع تبرير مختصر.',
+        'اربط الردود بالسياق السابق للطالب إن وُجد.',
+        noContextHint
+      ].filter(Boolean).join('\n')
+    : [
+        'You are a study assistant for pharmacy students. Be concise and exam-oriented.',
+        'Use clear steps and small headers when helpful.',
+        'If asked for MCQs, provide multiple-choice items with the answer key and brief rationales.',
+        'Tie responses to the ongoing topic if present.',
+        noContextHint
+      ].filter(Boolean).join('\n');
+
+  // Build chat messages: brief memory + (optional) pinned topic + retrieved context
+  const pinned = session.pinnedTopic ? (lang === 'AR'
+    ? `الموضوع المثبت في هذه المحادثة: ${session.pinnedTopic}`
+    : `Pinned topic in this chat: ${session.pinnedTopic}`) : null;
+
+  const ctxLabel = lang === 'AR' ? 'سياق من المراجع:' : 'Context from references:';
+  const userMsg = lang === 'AR'
+    ? `سؤال الطالب: ${question}`
+    : `Student question: ${question}`;
+
+  const msgArr = [];
+  if (pinned) msgArr.push({ role: 'system', content: pinned });
+  if (contextText) msgArr.push({ role: 'system', content: `${ctxLabel}\n${contextText}` });
+
+  // include short rolling history (user/assistant only)
+  for (const m of session.history.slice(-8)) {
+    // Avoid duplicating this turn's user message here; we add fresh one next.
+    msgArr.push({ role: m.role, content: m.content });
+  }
+  msgArr.push({ role: 'user', content: userMsg });
+
+  let finalAnswer = '';
+  try {
+    finalAnswer = await chatComplete(sys, msgArr, lang);
+  } catch (e) {
+    return res.status(500).json({ error: 'Chat failed', detail: String(e.message || e) });
+  }
+
+  // Save assistant reply to memory
+  pushHistory(session, 'assistant', finalAnswer);
+
+  // Pin a topic if not pinned yet (help “compare …” & “MCQs please”)
+  if (!session.pinnedTopic) {
+    const t = extractTopic(finalAnswer);
+    if (t) session.pinnedTopic = t;
+  }
+
+  // Prepare sources (top 5 cleaned)
+  const sources = cleanSources(matches);
+
+  // Answer out
+  res.json({
+    answer: finalAnswer,
+    sources,
+    debug: {
+      usedMatches: matches.length,
+      pineconeError: pineconeError || null,
+      lang,
+      stage,
+      subject,
+      pinnedTopic: session.pinnedTopic || null
+    }
+  });
+});
+
+// -------------------------
+// Start server
+// -------------------------
+app.listen(PORT, () => {
+  console.log(`PharmaNinja backend listening on :${PORT}`);
+});
