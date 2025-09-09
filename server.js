@@ -1,4 +1,4 @@
-// server.js (PharmaNinja Backend) — Patched 2025-09-09
+k// server.js (PharmaNinja Backend) — patched for Pinecone TLS fallback
 
 // -------------------------
 // Imports & basic setup
@@ -11,7 +11,7 @@ let fetchFn = global.fetch;
 try {
   if (!fetchFn) fetchFn = require('node-fetch');
 } catch (_) {
-  // Node 18+ has global.fetch; ignore if node-fetch not present
+  // Node 18+ has global.fetch
 }
 const fetch = (...args) => fetchFn(...args);
 
@@ -25,15 +25,17 @@ app.use(express.json({ limit: '1mb' }));
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY || '';
 const PINECONE_INDEX = process.env.PINECONE_INDEX || 'pharmaninja-bot-1536';
-const PINECONE_HOST = process.env.PINECONE_HOST || `${PINECONE_INDEX}.svc.gcp-starter.pinecone.io`;
+const PINECONE_HOST =
+  process.env.PINECONE_HOST ||
+  `${PINECONE_INDEX}.svc.gcp-starter.pinecone.io`;
 
 const PORT = process.env.PORT || 3000;
 const EMBEDDING_MODEL = 'text-embedding-3-small'; // 1536 dims
 
-// In-memory session store (use Redis for production persistence)
-const SESSIONS = new Map(); // sessionId -> { lang, stage, subject, pinnedTopic, history: [{role, content}], ts }
+// Sessions memory (rolling)
+const SESSIONS = new Map();
 
-// Force IPv4 + keep sockets alive to avoid TLS issues
+// Force IPv4 to avoid TLS issues
 const agentV4 = new https.Agent({
   keepAlive: true,
   maxSockets: 50,
@@ -61,8 +63,13 @@ function getOrInitSession(sessionId) {
 }
 
 function pushHistory(session, role, content) {
-  session.history.push({ role, content: String(content || '').slice(0, 2000) });
-  if (session.history.length > 10) session.history = session.history.slice(-10);
+  session.history.push({
+    role,
+    content: String(content || '').slice(0, 2000)
+  });
+  if (session.history.length > 10) {
+    session.history = session.history.slice(-10);
+  }
   session.ts = Date.now();
 }
 
@@ -76,7 +83,7 @@ function detectMCQ(q, lang) {
 function cleanSources(matches) {
   return (matches || [])
     .slice(0, 5)
-    .map(m => {
+    .map((m) => {
       const id = m?.id || '';
       const file = m?.metadata?.file || m?.metadata?.source || id;
       return { id, file, score: m?.score ?? undefined };
@@ -85,14 +92,18 @@ function cleanSources(matches) {
 
 function extractTopic(text) {
   if (!text) return null;
-  const firstLine = text.split('\n').find(l => l.trim().length > 0) || '';
-  const t = firstLine.replace(/^#+\s*/, '').replace(/\*\*|__/g, '').trim();
+  const firstLine =
+    text.split('\n').find((l) => l.trim().length > 0) || '';
+  const t = firstLine
+    .replace(/^#+\s*/, '')
+    .replace(/\*\*|__/g, '')
+    .trim();
   if (t.length >= 6 && t.length <= 120) return t;
   return text.split(/\s+/).slice(0, 10).join(' ');
 }
 
 // -------------------------
-// OpenAI calls
+// OpenAI
 // -------------------------
 async function embedTexts(texts) {
   const url = 'https://api.openai.com/v1/embeddings';
@@ -100,7 +111,7 @@ async function embedTexts(texts) {
   const r = await fetch(url, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify(body),
@@ -111,7 +122,7 @@ async function embedTexts(texts) {
     throw new Error(`OpenAI embeddings ${r.status}: ${txt}`);
   }
   const json = await r.json();
-  return (json?.data || []).map(d => d.embedding);
+  return (json?.data || []).map((d) => d.embedding);
 }
 
 async function chatComplete(systemPrompt, messages) {
@@ -119,15 +130,12 @@ async function chatComplete(systemPrompt, messages) {
   const body = {
     model: 'gpt-4o-mini',
     temperature: 0.2,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      ...messages
-    ]
+    messages: [{ role: 'system', content: systemPrompt }, ...messages]
   };
   const r = await fetch(url, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify(body),
@@ -142,13 +150,17 @@ async function chatComplete(systemPrompt, messages) {
 }
 
 // -------------------------
-// Pinecone with retry/fallback
+// Pinecone
 // -------------------------
-async function pineconeQuerySafe({ indexHost, namespace, vector, topK = 8, filter = {} }, tries = 3) {
+async function pineconeQuerySafe(
+  { indexHost, namespace, vector, topK = 8, filter = {} },
+  tries = 3
+) {
   if (!indexHost) throw new Error('Missing Pinecone host');
   const url = `https://${indexHost}/query`;
 
-  const finalFilter = (filter && Object.keys(filter).length) ? filter : undefined;
+  const finalFilter =
+    filter && Object.keys(filter).length ? filter : undefined;
 
   const body = {
     vector,
@@ -173,8 +185,11 @@ async function pineconeQuerySafe({ indexHost, namespace, vector, topK = 8, filte
       });
       if (!r.ok) {
         const txt = await r.text().catch(() => '');
-        if ([408, 425, 429, 500, 502, 503, 504].includes(r.status) && i < tries) {
-          await new Promise(res => setTimeout(res, 500 * i));
+        if (
+          [408, 425, 429, 500, 502, 503, 504].includes(r.status) &&
+          i < tries
+        ) {
+          await new Promise((res) => setTimeout(res, 500 * i));
           continue;
         }
         throw new Error(`Pinecone ${r.status}: ${txt}`);
@@ -182,7 +197,10 @@ async function pineconeQuerySafe({ indexHost, namespace, vector, topK = 8, filte
       return await r.json();
     } catch (e) {
       lastErr = e;
-      if (i < tries) await new Promise(res => setTimeout(res, 600 * i));
+      if (i < tries) {
+        await new Promise((res) => setTimeout(res, 600 * i));
+        continue;
+      }
     }
   }
   throw lastErr || new Error('Pinecone query failed');
@@ -192,62 +210,33 @@ async function pineconeQuerySafe({ indexHost, namespace, vector, topK = 8, filte
 // Health endpoints
 // -------------------------
 app.get('/ping', (req, res) => res.send('pong'));
-
-app.get('/health', (req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), ts: Date.now() });
-});
-
-app.get('/selftest', async (req, res) => {
-  const out = {
-    env: {
-      OPENAI_API_KEY: !!OPENAI_API_KEY,
-      PINECONE_API_KEY: !!PINECONE_API_KEY,
-      PINECONE_INDEX
-    },
-    openai: {},
-    pinecone: {}
-  };
-  try {
-    const [vec] = await embedTexts(['hello world']);
-    out.openai.ok = Array.isArray(vec) && vec.length > 0;
-    out.openai.dim = Array.isArray(vec) ? vec.length : 0;
-  } catch (e) {
-    out.openai.ok = false;
-    out.openai.note = String(e.message || e);
-  }
-
-  try {
-    const probe = await pineconeQuerySafe({
-      indexHost: PINECONE_HOST,
-      namespace: undefined,
-      vector: new Array(1536).fill(0),
-      topK: 1,
-      filter: { probe: true }
-    });
-    out.pinecone.ok = true;
-    out.pinecone.note = `topK=${(probe?.matches || []).length}`;
-  } catch (e) {
-    out.pinecone.ok = false;
-    out.pinecone.note = String(e.message || e);
-  }
-  res.json(out);
-});
+app.get('/health', (req, res) =>
+  res.json({ ok: true, uptime: process.uptime(), ts: Date.now() })
+);
 
 // -------------------------
-// Main query endpoint
+// Query endpoint
 // -------------------------
 app.post('/query', async (req, res) => {
-  const { sessionId: rawSessionId, lang: langIn, stage: stageIn, subject: subjectIn, question: rawQuestion } = req.body || {};
+  const { sessionId: rawSessionId, lang: langIn, stage: stageIn, subject: subjectIn, question: rawQuestion } =
+    req.body || {};
 
   const sessionId = (rawSessionId || '').trim() || `${req.ip}:${Date.now()}`;
   const session = getOrInitSession(sessionId);
 
-  if (langIn) session.lang = (langIn || '').toUpperCase() === 'AR' ? 'AR' : 'EN';
+  if (langIn) session.lang = langIn.toUpperCase() === 'AR' ? 'AR' : 'EN';
   if (stageIn) session.stage = String(stageIn || '');
   if (subjectIn) session.subject = String(subjectIn || '');
 
   const question = String(rawQuestion || '').trim();
+  if (!question) {
+    return res.json({
+      answer: session.lang === 'AR' ? 'اكتب سؤالك.' : 'Ask your question.',
+      sources: []
+    });
+  }
 
+  // Language toggle
   if (/^\s*arabic\s*$/i.test(question)) {
     session.lang = 'AR';
     pushHistory(session, 'user', question);
@@ -263,10 +252,6 @@ app.post('/query', async (req, res) => {
   const stage = session.stage;
   const subject = session.subject;
 
-  if (!question) {
-    return res.json({ answer: lang === 'AR' ? 'اكتب سؤالك.' : 'Ask your question.', sources: [] });
-  }
-
   pushHistory(session, 'user', question);
 
   let embed;
@@ -281,7 +266,10 @@ app.post('/query', async (req, res) => {
   let pineconeError = null;
 
   try {
-    const namespace = (lang || stage || subject) ? `${(lang || '').trim()}::${(stage || '').trim()}::${(subject || '').trim()}` : undefined;
+    const namespace =
+      lang || stage || subject
+        ? `${(lang || '').trim()}::${(stage || '').trim()}::${(subject || '').trim()}`
+        : undefined;
     const filter = {};
     if (lang) filter.lang = lang;
     if (stage) filter.stage = stage;
@@ -294,10 +282,11 @@ app.post('/query', async (req, res) => {
       topK: needMCQs ? 12 : 8,
       filter
     });
-    matches = (pcResp?.matches || []).filter(m => m?.metadata);
+    matches = (pcResp?.matches || []).filter((m) => m?.metadata);
   } catch (err) {
     pineconeError = String(err?.message || err);
-    console.warn('Pinecone fallback -> using empty context:', pineconeError);
+    console.warn('⚠️ Pinecone unreachable, continuing without context:', pineconeError);
+    matches = [];
   }
 
   let contextText = '';
@@ -308,31 +297,35 @@ app.post('/query', async (req, res) => {
     contextText += (contextText ? '\n\n' : '') + chunk;
   }
 
-  const noContextHint = matches.length === 0
-    ? (lang === 'AR'
-      ? '⚠️ لا يوجد سياق مسترجع الآن. أجب بإيجاز واذكر أن المصادر غير متاحة.'
-      : '⚠️ No retrieved context right now. Answer briefly and note that sources are unavailable.')
-    : '';
+  const noContextHint =
+    matches.length === 0
+      ? lang === 'AR'
+        ? '⚠️ لا يوجد سياق مسترجع الآن. أجب بإيجاز واذكر أن المصادر غير متاحة.'
+        : '⚠️ No retrieved context right now. Answer briefly and note that sources are unavailable.'
+      : '';
 
-  const sys = (lang === 'AR')
-    ? [
-        'أنت مساعد دراسي لطلاب الصيدلة. أجب بإيجاز وبأسلوب امتحاني.',
-        'استخدم خطوات منظمة وعناوين فرعية عند الحاجة.',
-        'إن طُلب MCQs، قدم أسئلة بخيارات وإجابة نموذجية.',
-        'اربط الردود بالسياق السابق للطالب إن وُجد.',
-        noContextHint
-      ].filter(Boolean).join('\n')
-    : [
-        'You are a study assistant for pharmacy students. Be concise and exam-oriented.',
-        'Use clear steps and small headers when helpful.',
-        'If asked for MCQs, provide multiple-choice items with the answer key.',
-        'Tie responses to the ongoing topic if present.',
-        noContextHint
-      ].filter(Boolean).join('\n');
+  const sys =
+    lang === 'AR'
+      ? [
+          'أنت مساعد دراسي لطلاب الصيدلة. أجب بإيجاز وبأسلوب امتحاني.',
+          'استخدم خطوات منظمة وعناوين فرعية عند الحاجة.',
+          'إن طُلب MCQs، قدم أسئلة بخيارات وإجابة نموذجية.',
+          'اربط الردود بالسياق السابق للطالب إن وُجد.',
+          noContextHint
+        ].filter(Boolean).join('\n')
+      : [
+          'You are a study assistant for pharmacy students. Be concise and exam-oriented.',
+          'Use clear steps and small headers when helpful.',
+          'If asked for MCQs, provide multiple-choice items with the answer key.',
+          'Tie responses to the ongoing topic if present.',
+          noContextHint
+        ].filter(Boolean).join('\n');
 
-  const pinned = session.pinnedTopic ? (lang === 'AR'
-    ? `الموضوع المثبت: ${session.pinnedTopic}`
-    : `Pinned topic: ${session.pinnedTopic}`) : null;
+  const pinned = session.pinnedTopic
+    ? lang === 'AR'
+      ? `الموضوع المثبت في هذه المحادثة: ${session.pinnedTopic}`
+      : `Pinned topic in this chat: ${session.pinnedTopic}`
+    : null;
 
   const ctxLabel = lang === 'AR' ? 'سياق من المراجع:' : 'Context from references:';
   const userMsg = lang === 'AR' ? `سؤال الطالب: ${question}` : `Student question: ${question}`;
@@ -347,13 +340,12 @@ app.post('/query', async (req, res) => {
 
   let finalAnswer = '';
   try {
-    finalAnswer = await chatComplete(sys, msgArr);
+    finalAnswer = await chatComplete(sys, msgArr, lang);
   } catch (e) {
     return res.status(500).json({ error: 'Chat failed', detail: String(e.message || e) });
   }
 
   pushHistory(session, 'assistant', finalAnswer);
-
   if (!session.pinnedTopic) {
     const t = extractTopic(finalAnswer);
     if (t) session.pinnedTopic = t;
