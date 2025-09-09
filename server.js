@@ -1,205 +1,291 @@
 // server.js
-import 'dotenv/config';
+// Pharmaninja backend — conversational memory + AR/EN + topic pin + guided followups
+// PASTE THIS WHOLE FILE to replace your current server.js
+
 import express from 'express';
 import cors from 'cors';
-import axios from 'axios';
+import bodyParser from 'body-parser';
+import fetch from 'node-fetch';
 import { Pinecone } from '@pinecone-database/pinecone';
 
-// ----------------------------
-// Basic setup
-// ----------------------------
+/* ---------- ENV ---------- */
+const PORT = process.env.PORT || 3000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
+const PINECONE_INDEX = process.env.PINECONE_INDEX || 'pharmaninja-bot-1536';
+if (!OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY');
+if (!PINECONE_API_KEY) throw new Error('Missing PINECONE_API_KEY');
+
+/* ---------- OPENAI (HTTP) ---------- */
+const OPENAI_URL = 'https://api.openai.com/v1';
+
+/* choose your models */
+const EMBEDDING_MODEL = 'text-embedding-3-small'; // 1536 dim
+const CHAT_MODEL = 'gpt-4o-mini';
+
+/* ---------- PINECONE ---------- */
+const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
+const index = pc.index(PINECONE_INDEX);
+
+/* ---------- EXPRESS ---------- */
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(bodyParser.json({ limit: '2mb' }));
 
-const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
-const index = pc.index(process.env.PINECONE_INDEX);
+/* ---------- IN-MEMORY SESSIONS ----------
+   s = {
+     lang: 'EN'|'AR',
+     stage: '3rd'|...,
+     subject: 'Pharmacology'|...,
+     topic: 'pinned topic for followups',
+     history: [{q,a,timestamp}]
+   }
+*/
+const sessions = new Map();
 
-// In-memory sessions (simple)
-const sessions = Object.create(null);
+/* ---------- UTILS ---------- */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ----------------------------
-// Helpers
-// ----------------------------
-function nonEmpty(obj) {
-  return obj && typeof obj === 'object' && Object.keys(obj).length > 0;
-}
 function getSession(id) {
-  if (!sessions[id]) sessions[id] = { history: [] };
-  return sessions[id];
+  if (!sessions.has(id)) sessions.set(id, { lang: 'EN', history: [] });
+  return sessions.get(id);
 }
-function trimStr(s, n = 1000) {
+function trimStr(s, n) {
   if (!s) return '';
-  return s.length <= n ? s : s.slice(0, n) + '…';
+  return s.length > n ? s.slice(0, n) + '…' : s;
 }
-function detectLangSwitch(q) {
+function extractCompareTarget(q, lang) {
   if (!q) return null;
   const t = q.trim().toLowerCase();
-  if (t === 'arabic' || t === 'ar') return 'AR';
-  if (t === 'english' || t === 'en') return 'EN';
+  if (lang === 'AR') {
+    const m = t.match(/قارن(?:\s+)?(?:مع|بين)\s+(.+)/);
+    return m ? m[1].trim() : null;
+  } else {
+    const m = t.match(/^compare\s+(?:with|vs\.?)\s+(.+)/);
+    return m ? m[1].trim() : null;
+  }
+}
+function normalizeLang(l) {
+  if (!l) return null;
+  const t = (l || '').toUpperCase();
+  if (t.startsWith('AR')) return 'AR';
+  if (t.startsWith('EN')) return 'EN';
   return null;
 }
-function isLikelyMCQRequest(q) {
-  if (!q) return false;
-  const t = q.toLowerCase();
-  return /\bmcq/.test(t) || /multiple[- ]choice/.test(t) || /اختيار/.test(t);
-}
 
-// ----------------------------
-// OpenAI helpers
-// ----------------------------
+/* ---------- OPENAI HELPERS ---------- */
 async function embed(text) {
-  const r = await axios.post(
-    'https://api.openai.com/v1/embeddings',
-    { input: text, model: 'text-embedding-3-small' }, // 1536-dim
-    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } }
-  );
-  return r.data.data[0].embedding;
+  const r = await fetch(`${OPENAI_URL}/embeddings`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      input: text,
+      model: EMBEDDING_MODEL
+    })
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error(`OpenAI embeddings ${r.status}: ${txt}`);
+  }
+  const j = await r.json();
+  return j.data[0].embedding;
 }
 
-async function chat(messages, model = 'gpt-4o-mini') {
-  const r = await axios.post(
-    'https://api.openai.com/v1/chat/completions',
-    { model, messages, temperature: 0.2 },
-    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } }
-  );
-  return r.data.choices?.[0]?.message?.content?.trim() || '';
+async function chat(messages) {
+  const r = await fetch(`${OPENAI_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: CHAT_MODEL,
+      messages,
+      temperature: 0.2
+    })
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error(`OpenAI chat ${r.status}: ${txt}`);
+  }
+  const j = await r.json();
+  return j.choices?.[0]?.message?.content?.trim() || '';
 }
 
-// ----------------------------
-// Health endpoints
-// ----------------------------
-app.get('/ping', (req, res) => res.type('text/plain').send('pong'));
-
-app.get('/health', (req, res) => {
-  res.json({ ok: true, uptime: process.uptime(), ts: Date.now() });
+/* ---------- HEALTH ---------- */
+app.get('/ping', (_req, res) => res.type('text/plain').send('pong'));
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, uptime: process.uptime() * 1000, ts: Date.now() });
 });
-
-app.get('/selftest', async (req, res) => {
+app.get('/selftest', async (_req, res) => {
   try {
-    // Check env
-    const env = {
-      OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
-      PINECONE_API_KEY: !!process.env.PINECONE_API_KEY,
-      PINECONE_INDEX: process.env.PINECONE_INDEX || null
-    };
-
-    // Check embeddings
-    let dim = 0;
+    // quick ping: openai embed, pinecone describe
+    let openaiOk = false;
+    let dim = null;
     try {
       const v = await embed('hello');
-      dim = v.length;
-    } catch (e) {
-      return res.json({ env, openai: { ok: false, note: `OpenAI embeddings error ${e.response?.status || ''}` } });
-    }
+      openaiOk = Array.isArray(v);
+      dim = v?.length || null;
+    } catch {}
 
-    // Light Pinecone check (no filter)
     let pineOk = false;
+    let matches = 0;
     try {
-      const pine = await index.query({ vector: Array(dim).fill(0), topK: 1, includeMetadata: true });
+      const q = await embed('test');
+      const pine = await index.query({ vector: q, topK: 1, includeMetadata: false });
       pineOk = true;
-    } catch {
-      pineOk = false;
-    }
+      matches = pine.matches?.length || 0;
+    } catch {}
 
     res.json({
-      env,
-      openai: { ok: dim > 0, dim },
-      pinecone: { ok: pineOk, matches: pineOk ? 1 : 0 }
+      env: {
+        OPENAI_API_KEY: !!OPENAI_API_KEY,
+        PINECONE_API_KEY: !!PINECONE_API_KEY,
+        PINECONE_INDEX
+      },
+      openai: { ok: openaiOk, dim },
+      pinecone: { ok: pineOk, matches }
     });
-  } catch (err) {
-    res.status(500).json({ error: 'Selftest failed', detail: String(err?.message || err) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// ----------------------------
-// Main query endpoint
-// ----------------------------
+/* ---------- QUERY ---------- */
 app.post('/query', async (req, res) => {
-  const body = req.body || {};
-  const sessionId = body.sessionId || `${req.ip}`;
+  const { sessionId, lang: bodyLang, stage, subject } = req.body || {};
+  let { question } = req.body || {};
+
+  if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
+
+  // session & prefs
   const s = getSession(sessionId);
+  // allow explicit override from body
+  if (normalizeLang(bodyLang)) s.lang = normalizeLang(bodyLang);
+  if (stage) s.stage = stage;
+  if (subject) s.subject = subject;
+
+  // allow single-word language switches via question
+  const qRaw = (question || '').trim();
+  if (/^\s*arabic\s*$/i.test(qRaw)) {
+    s.lang = 'AR';
+    return res.json({ answer: 'تم! اكتب سؤالك الآن بالعربية.', sources: [] });
+  }
+  if (/^\s*english\s*$/i.test(qRaw)) {
+    s.lang = 'EN';
+    return res.json({ answer: 'Done! Ask your question in English.', sources: [] });
+  }
+
+  const lang = s.lang || 'EN';
+  const prefsLine =
+    (lang === 'AR')
+      ? `المرحلة: ${s.stage || '-'} | المادة: ${s.subject || '-'}`
+      : `Stage: ${s.stage || '-'} | Subject: ${s.subject || '-'}`;
+
+  // pin a topic softly from the first meaningful question (no commands like "MCQs please")
+  if (!s.topic) {
+    const qForTopic = qRaw.toLowerCase();
+    if (qForTopic && !/^mcqs?(\s|$)/i.test(qForTopic) && !/^قارن/.test(qForTopic)) {
+      // simple topic pin from the user’s wording
+      s.topic = trimStr(qRaw.replace(/^(explain|اشرح)\s*/i, ''), 80);
+    }
+  }
+  const topicLine = s.topic
+    ? (lang === 'AR' ? `الموضوع المثبّت: ${s.topic}` : `Pinned topic: ${s.topic}`)
+    : (lang === 'AR' ? 'لا يوجد موضوع مثبّت بعد.' : 'No topic pinned yet.');
+
+  // REWRITE: "compare with ..." or "قارن مع/بين ..."
+  const cmpTarget = extractCompareTarget(qRaw, lang);
+  let rewrittenQuestion = qRaw || '';
+  if (cmpTarget && s.topic) {
+    rewrittenQuestion = (lang === 'AR')
+      ? `قارن بين "${s.topic}" و "${cmpTarget}".`
+      : `Compare "${s.topic}" with "${cmpTarget}".`;
+  }
+
+  // MCQ hint for the model (kept short)
+  const mcqHint =
+    (/^mcqs?(\s|$)/i.test(qRaw) || /^أسئلة(?:\s|-)?اختيار(?:\s|-)?من(?:\s|-)?متعدد/i.test(qRaw))
+      ? (lang === 'AR'
+          ? 'إن طلبت MCQs، أعطني أسئلة قصيرة مع مفتاح الإجابة في النهاية.'
+          : 'If I ask for MCQs, give short items with an answer key at the end.')
+      : '';
 
   try {
-    let { lang, stage, subject, question } = body;
-
-    // Mid-chat language switch
-    const langSwitch = detectLangSwitch(question);
-    if (langSwitch) {
-      s.lang = langSwitch;
-      return res.json({
-        answer: langSwitch === 'AR' ? 'تم! اكتب سؤالك الآن بالعربية.' : 'Done! Ask your question in English.',
-        sources: []
-      });
-    }
-
-    // Keep / backfill session prefs
-    lang = lang || s.lang || 'EN';
-    stage = stage || s.stage;
-    subject = subject || s.subject;
-
-    if (!s.lang) s.lang = lang;
-    if (!s.stage && stage) s.stage = stage;
-    if (!s.subject && subject) s.subject = subject;
-
-    // Pin a topic from the first substantive question
-    if (!s.topic && question && question.length > 8) {
-      s.topic = trimStr(question, 120);
-    }
-
-    // Empty question? Prompt to ask
-    if (!question || !question.trim()) {
+    // No question? prompt user
+    if (!rewrittenQuestion) {
       return res.json({
         answer: lang === 'AR' ? 'اكتب سؤالك.' : 'Ask your question.',
         sources: []
       });
     }
 
-    // Embed the user question
-    const qVec = await embed(question);
+    // EMBED
+    const qVec = await embed(rewrittenQuestion);
 
-    // ---------- Pinecone filter (SAFE) ----------
+    // SAFE Pinecone filter: only include metadata we *actually stored*
     const filter = {};
-    if (stage) filter.stage = stage;
-    if (subject) filter.subject = subject;
-    if (s.topic) filter.topic = s.topic; // optional if you stored topic with each vector
+    if (s.stage)   filter.stage = s.stage;
+    if (s.subject) filter.subject = s.subject;
+    // IMPORTANT: do NOT add s.topic here unless you actually upserted it in metadata
+    // if (s.topic) filter.topic = s.topic; // <-- leave OUT
 
     const pineParams = {
       vector: qVec,
       topK: 5,
       includeMetadata: true
     };
-    if (nonEmpty(filter)) pineParams.filter = filter;
+    if (Object.keys(filter).length > 0) pineParams.filter = filter;
 
     const pine = await index.query(pineParams);
-    const matches = pine.matches || [];
 
-    // Build context from top matches
-    const context = matches
-      .map((m, i) => `[#${i + 1}] ${trimStr(m.metadata?.text || '', 700)}`)
-      .join('\n\n');
+    // Build context + sources
+    const hits = pine.matches || [];
+    const context = hits
+      .map((m, i) => {
+        const meta = m.metadata || {};
+        const text = meta.text || meta.chunk || '';
+        const src = meta.file || meta.id || meta.source || '';
+        return `[#${i + 1}] ${src}\n${text}`;
+      })
+      .join('\n\n---\n\n');
 
-    // ---- Build the chat messages ----
-    const sys = (lang === 'AR')
-      ? 'أنت مُعلِّم صيدلة مساعد وودود. اشرح بإيجاز وبأسلوب منظم للامتحان. إن لم تكن المعلومة في السياق، أذكر ذلك بصراحة.'
-      : 'You are a helpful pharmacy study tutor. Be concise, exam-oriented, and structured. If info is not in context, say so.';
+    const sources = hits.map((m, i) => {
+      const meta = m.metadata || {};
+      return {
+        id: meta.file || meta.id || (m.id || `match-${i + 1}`),
+        score: m.score
+      };
+    });
 
-    const topicLine = s.topic
-      ? (lang === 'AR' ? `الموضوع الحالي: ${s.topic}` : `Current topic: ${s.topic}`)
-      : (lang === 'AR' ? 'لا يوجد موضوع مثبت بعد.' : 'No pinned topic yet.');
+    // Short recent history (last 3 Q&A)
+    const historyTail = (s.history || [])
+      .slice(-3)
+      .map(h => `Q: ${trimStr(h.q, 200)}\nA: ${trimStr(h.a, 300)}`)
+      .join('\n---\n');
 
-    const prefsLine = [
-      stage ? (lang === 'AR' ? `المرحلة: ${stage}` : `Stage: ${stage}`) : null,
-      subject ? (lang === 'AR' ? `المادة: ${subject}` : `Subject: ${subject}`) : null
-    ].filter(Boolean).join(' | ');
-
-    const mcqHint = isLikelyMCQRequest(question)
+    const histBlock = historyTail
       ? (lang === 'AR'
-          ? 'أنتج 5 أسئلة اختيار من متعدد (أ، ب، ج، د) حول الموضوع الحالي. ضع الإجابات بعد ذلك.'
-          : 'Produce 5 multiple-choice questions (A–D) about the current topic, then give an answer key.')
-      : (lang === 'AR'
-          ? 'أجب بشكل واضح وبنقاط موجزة.'
-          : 'Answer clearly in concise bullet points.');
+          ? `\nآخر الحوار:\n${historyTail}\n`
+          : `\nRecent context:\n${historyTail}\n`)
+      : '';
+
+    // SYSTEM PROMPT
+    const sys =
+      (lang === 'AR')
+        ? `أنت مُعلّم صيدلة ذكي: مختصر، دقيق، موجّه للاختبارات.
+- استخدم لغة بسيطة وعناوين فرعية ونِقاط.
+- اربط الإجابات بسياق السؤال والمصادر المقتبسة عند وجودها.
+- عندما dim أو السياق ضعيفان، كن واضحًا بما لا تعرفه واقترح سؤالًا متابعة مناسبًا.
+- عند طلب MCQs أعطِ أسئلة قصيرة متدرجة الصعوبة مع مفتاح الإجابة في النهاية.`
+        : `You are a smart pharmacy tutor: concise, accurate, exam-oriented.
+- Use plain language, mini-headings, and bullets.
+- Tie answers to the user’s question and the retrieved context when helpful.
+- If signal is weak, say so and propose a reasonable follow-up.
+- When asked for MCQs, provide short items with an answer key at the end.`;
 
     const messages = [
       { role: 'system', content: sys },
@@ -209,45 +295,40 @@ app.post('/query', async (req, res) => {
 `${lang === 'AR' ? 'لغة الإجابة' : 'Answer language'}: ${lang}
 ${prefsLine}
 ${topicLine}
+${histBlock}
 
 ${lang === 'AR' ? 'السياق' : 'Context'}:
 ${context || (lang === 'AR' ? '(لا سياق متاح)' : '(no context available)')}
 
-${lang === 'AR' ? 'السؤال' : 'Question'}: ${question}
+${lang === 'AR' ? 'السؤال' : 'Question'}: ${rewrittenQuestion}
 
 ${mcqHint}
 `
       }
     ];
 
-    const answer = await chat(messages);
+    // CHAT
+    let answer = await chat(messages);
+    if (!answer) {
+      answer = lang === 'AR'
+        ? 'عذرًا، لم أجد إجابة موثوقة من السياق.'
+        : 'Sorry, I could not find a reliable answer from context.';
+    }
 
-    // Save a small rolling history (optional)
-    s.history.push({ q: question, a: answer });
-    if (s.history.length > 8) s.history.shift();
+    // Save to history using the rewritten question
+    s.history.push({ q: rewrittenQuestion, a: answer, t: Date.now() });
 
-    // Return sources
-    const sources = matches.map(m => ({
-      id: m.id,
-      score: m.score,
-      file: m.metadata?.file || m.id,
-      lang: m.metadata?.lang,
-      stage: m.metadata?.stage,
-      subject: m.metadata?.subject
-    }));
-
-    res.json({ answer, sources });
-  } catch (err) {
-    const detail = err?.response?.data ? JSON.stringify(err.response.data, null, 2) : String(err?.message || err);
-    console.error('Query failed:', detail);
-    res.status(500).json({ error: 'Query failed', detail });
+    return res.json({
+      answer,
+      sources: sources.slice(0, 5)
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'Query failed', detail: String(e) });
   }
 });
 
-// ----------------------------
-// Start
-// ----------------------------
-const PORT = process.env.PORT || 3000;
+/* ---------- START ---------- */
 app.listen(PORT, () => {
-  console.log(`API listening on :${PORT}`);
+  console.log(`pharmaninja-backend listening on :${PORT}`);
 });
