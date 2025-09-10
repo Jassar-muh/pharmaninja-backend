@@ -1,5 +1,7 @@
-// server.js — ESM version (Render-friendly) with graceful Pinecone fallback
+// server.js — ESM (Render-friendly) with graceful Pinecone fallback + tiny chat memory
+// Keep this FIRST so .env is loaded before anything uses it
 import 'dotenv/config';
+
 import express from 'express';
 import cors from 'cors';
 import { Agent as HttpsAgent } from 'node:https';
@@ -7,20 +9,24 @@ import { Agent as HttpsAgent } from 'node:https';
 // -------------------------
 // Config & constants
 // -------------------------
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_API_KEY  = process.env.OPENAI_API_KEY || '';
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY || '';
-const PINECONE_INDEX = process.env.PINECONE_INDEX || 'pharmaninja-bot-1536';
-const PINECONE_HOST = process.env.PINECONE_HOST || ''; // <— set this in Render
+const PINECONE_INDEX   = process.env.PINECONE_INDEX || 'pharmaninja-bot-1536';
+// Strongly recommended: set PINECONE_HOST explicitly in Render env
+const PINECONE_HOST    = process.env.PINECONE_HOST || '';
 
 const PORT = process.env.PORT || 3000;
 
-// Embedding model must match your Pinecone index dim (1536)
+// Embedding model must match your Pinecone index dimension (1536)
 const EMBEDDING_MODEL = 'text-embedding-3-small';
 
-// Small in-memory session store
-const SESSIONS = new Map(); // sessionId -> { lang, stage, subject, pinnedTopic, history: [{role, content}], ts }
+// Toggle: if Pinecone is flaky, you can temporarily disable vector lookup
+const USE_EMBEDDINGS = process.env.USE_EMBEDDINGS !== 'false';
 
-// Optional IPv4-only agent (used only for Node core HTTPS; fetch(undici) doesn’t use this)
+// Small in-memory session store (per-process; swap for Redis if you need persistence)
+const SESSIONS = new Map(); // sessionId -> { lang, stage, subject, pinnedTopic, history:[{role,content}], ts }
+
+// IPv4-only agent (for Node core HTTPS). undici/fetch may not use it; kept for completeness.
 const agentV4 = new HttpsAgent({ keepAlive: true, maxSockets: 50, timeout: 30000, family: 4 });
 
 // -------------------------
@@ -65,46 +71,46 @@ function cleanSources(matches) {
     });
 }
 
+// Simple topic extraction: first header-ish line of assistant’s answer
 function extractTopic(text) {
   if (!text) return null;
-  const firstLine = text.split('\n').find(l => l.trim()) || '';
+  const firstLine = text.split('\n').find(l => l.trim().length > 0) || '';
   const t = firstLine.replace(/^#+\s*/, '').replace(/\*\*|__/g, '').trim();
   if (t.length >= 6 && t.length <= 120) return t;
   return text.split(/\s+/).slice(0, 10).join(' ');
 }
 
 // -------------------------
-// OpenAI
+// OpenAI calls
 // -------------------------
 async function embedTexts(texts) {
-  const r = await fetch('https://api.openai.com/v1/embeddings', {
+  const url = 'https://api.openai.com/v1/embeddings';
+  const body = { model: EMBEDDING_MODEL, input: texts };
+  const r = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ model: EMBEDDING_MODEL, input: texts })
+    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
   if (!r.ok) {
     const txt = await r.text().catch(() => '');
     throw new Error(`OpenAI embeddings ${r.status}: ${txt}`);
   }
   const json = await r.json();
-  return (json?.data || []).map(d => d.embedding);
+  const vectors = (json?.data || []).map(d => d.embedding);
+  return vectors;
 }
 
 async function chatComplete(systemPrompt, messages) {
-  const r = await fetch('https://api.openai.com/v1/chat/completions', {
+  const url = 'https://api.openai.com/v1/chat/completions';
+  const body = {
+    model: process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini',
+    temperature: 0.2,
+    messages: [{ role: 'system', content: systemPrompt }, ...messages]
+  };
+  const r = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      temperature: 0.2,
-      messages: [{ role: 'system', content: systemPrompt }, ...messages]
-    })
+    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
   if (!r.ok) {
     const txt = await r.text().catch(() => '');
@@ -115,18 +121,13 @@ async function chatComplete(systemPrompt, messages) {
 }
 
 // -------------------------
-// Pinecone (graceful)
+// Pinecone
 // -------------------------
-async function pineconeQuerySafe({ host, namespace, vector, topK = 8, filter = {} }, tries = 2) {
-  if (!PINECONE_API_KEY || !host) {
-    // Explicitly signal that retrieval is disabled/missing config
-    const why = !PINECONE_API_KEY ? 'no_api_key' : 'no_host';
-    const err = new Error(`PINECONE_DISABLED:${why}`);
-    err.code = 'PINECONE_DISABLED';
-    throw err;
-  }
+async function pineconeQuerySafe({ indexHost, namespace, vector, topK = 8, filter = {} }, tries = 3) {
+  if (!indexHost) throw new Error('Missing Pinecone host');
+  const url = `https://${indexHost}/query`;
 
-  const url = `https://${host}/query`;
+  // Pinecone rejects empty filter object — use undefined if empty
   const finalFilter = (filter && typeof filter === 'object' && Object.keys(filter).length)
     ? filter
     : undefined;
@@ -150,15 +151,13 @@ async function pineconeQuerySafe({ host, namespace, vector, topK = 8, filter = {
       });
       if (!r.ok) {
         const txt = await r.text().catch(() => '');
-        // Retry only on transient statuses
         if ([408, 425, 429, 500, 502, 503, 504].includes(r.status) && i < tries) {
           await new Promise(res => setTimeout(res, 500 * i));
           continue;
         }
         throw new Error(`Pinecone ${r.status}: ${txt}`);
       }
-      const json = await r.json();
-      return json;
+      return await r.json();
     } catch (e) {
       lastErr = e;
       if (i < tries) {
@@ -201,15 +200,20 @@ app.get('/selftest', async (_req, res) => {
   }
 
   try {
-    const probe = await pineconeQuerySafe({
-      host: PINECONE_HOST,
-      namespace: undefined,
-      vector: new Array(1536).fill(0),
-      topK: 1,
-      filter: { probe: true }
-    });
-    out.pinecone.ok = true;
-    out.pinecone.matches = (probe?.matches || []).length;
+    if (USE_EMBEDDINGS && PINECONE_HOST) {
+      const probe = await pineconeQuerySafe({
+        indexHost: PINECONE_HOST,
+        namespace: undefined,
+        vector: new Array(1536).fill(0),
+        topK: 1,
+        filter: { probe: true }
+      });
+      out.pinecone.ok = true;
+      out.pinecone.note = `topK=${(probe?.matches || []).length}`;
+    } else {
+      out.pinecone.ok = false;
+      out.pinecone.note = 'skipped (USE_EMBEDDINGS=false or no PINECONE_HOST)';
+    }
   } catch (e) {
     out.pinecone.ok = false;
     out.pinecone.err = String(e.message || e);
@@ -219,7 +223,7 @@ app.get('/selftest', async (_req, res) => {
 });
 
 // -------------------------
-// Main query
+// Main query endpoint
 // -------------------------
 app.post('/query', async (req, res) => {
   try {
@@ -234,12 +238,15 @@ app.post('/query', async (req, res) => {
     const sessionId = (rawSessionId || '').trim() || `${req.ip}:${Date.now()}`;
     const session = getOrInitSession(sessionId);
 
+    // Merge preferences if provided
     if (langIn) session.lang = (String(langIn).toUpperCase() === 'AR') ? 'AR' : 'EN';
-    if (stageIn) session.stage = String(stageIn);
-    if (subjectIn) session.subject = String(subjectIn);
+    if (stageIn) session.stage = String(stageIn || '');
+    if (subjectIn) session.subject = String(subjectIn || '');
 
+    // Safe question text
     const question = String(rawQuestion || '').trim();
 
+    // Language toggle by keyword
     if (/^\s*arabic\s*$/i.test(question)) {
       session.lang = 'AR';
       pushHistory(session, 'user', question);
@@ -255,28 +262,23 @@ app.post('/query', async (req, res) => {
     const stage = session.stage;
     const subject = session.subject;
 
+    // If no question, nudge
     if (!question) {
       return res.json({ answer: lang === 'AR' ? 'اكتب سؤالك.' : 'Ask your question.', sources: [] });
     }
 
+    // Remember user question
     pushHistory(session, 'user', question);
 
-    // Embedding (for retrieval if available)
-    let embed = null;
-    try {
-      [embed] = await embedTexts([question]);
-    } catch (e) {
-      // If embeddings fail, continue without retrieval
-      embed = null;
-    }
-
-    // Retrieval (best-effort only)
+    // --- Retrieval (optional & resilient) ---
     const needMCQs = detectMCQ(question, lang);
     let matches = [];
-    let pineconeInfo = { ok: false, note: 'skipped' };
+    let pineconeNote = null;
 
-    if (embed) {
+    if (USE_EMBEDDINGS && PINECONE_HOST) {
       try {
+        const [embed] = await embedTexts([question]);
+
         const namespace = (lang || stage || subject)
           ? `${(lang || '').trim()}::${(stage || '').trim()}::${(subject || '').trim()}`
           : undefined;
@@ -286,22 +288,25 @@ app.post('/query', async (req, res) => {
         if (stage) filter.stage = stage;
         if (subject) filter.subject = subject;
 
-        const pc = await pineconeQuerySafe({
-          host: PINECONE_HOST,
+        const pcResp = await pineconeQuerySafe({
+          indexHost: PINECONE_HOST,
           namespace,
           vector: embed,
           topK: needMCQs ? 12 : 8,
           filter
         });
-        matches = (pc?.matches || []).filter(m => m?.metadata);
-        pineconeInfo = { ok: true, note: `matches=${matches.length}` };
-      } catch (e) {
-        // swallow Pinecone errors; proceed with empty context
-        pineconeInfo = { ok: false, note: String(e.message || e) };
+
+        matches = (pcResp?.matches || []).filter(m => m?.metadata);
+        pineconeNote = `ok (matches=${matches.length})`;
+      } catch (err) {
+        pineconeNote = `skipped (fallback) — ${String(err && err.message || err)}`;
+        matches = []; // fall back to zero-context
       }
+    } else {
+      pineconeNote = 'disabled or no host';
     }
 
-    // Build short context text
+    // Build context text from matches (cap ~2.8k chars)
     let contextText = '';
     for (const m of matches) {
       const chunk = m?.metadata?.text || m?.metadata?.chunk || '';
@@ -310,28 +315,31 @@ app.post('/query', async (req, res) => {
       contextText += (contextText ? '\n\n' : '') + chunk;
     }
 
+    // Small “no context” hint
     const noContextHint = matches.length === 0
       ? (lang === 'AR'
           ? '⚠️ لا يوجد سياق مسترجع الآن. أجب بإيجاز واذكر أن المصادر غير متاحة.'
-          : '⚠️ No retrieved context right now. Answer briefly and note that sources are unavailable.')
+          : '⚠️ No retrieved context right now. Answer briefly and mention that sources are unavailable.')
       : '';
 
+    // Personality / guardrails
     const sys = (lang === 'AR')
       ? [
           'أنت مساعد دراسي لطلاب الصيدلة. أجب بإيجاز وبأسلوب امتحاني.',
-          'استخدم عناوين وخطوات واضحة عند الحاجة.',
-          'إن طُلب MCQs، قدّم أسئلة بخيارات وإجابات مختصرة.',
-          'اربط الردود بسياق المحادثة إن وُجد.',
+          'استخدم عناوين فرعية وخطوات واضحة عند الحاجة.',
+          'إن طُلِب MCQs، قدم أسئلة بخيارات وإجابة نموذجية مع تبرير مختصر.',
+          'اربط الإجابة بالسياق السابق إن وُجد.',
           noContextHint
         ].filter(Boolean).join('\n')
       : [
           'You are a study assistant for pharmacy students. Be concise and exam-oriented.',
-          'Use clear headers and steps when helpful.',
-          'If asked for MCQs, provide choices with a brief key.',
-          'Tie responses to the ongoing chat topic.',
+          'Use short headers and clear steps when helpful.',
+          'If asked for MCQs, include options + key + brief rationales.',
+          'Tie your answer to the ongoing topic if present.',
           noContextHint
         ].filter(Boolean).join('\n');
 
+    // Build messages (pinned topic + context + short memory + current question)
     const pinned = session.pinnedTopic
       ? (lang === 'AR'
           ? `الموضوع المثبت في هذه المحادثة: ${session.pinnedTopic}`
@@ -345,35 +353,54 @@ app.post('/query', async (req, res) => {
     if (pinned) msgArr.push({ role: 'system', content: pinned });
     if (contextText) msgArr.push({ role: 'system', content: `${ctxLabel}\n${contextText}` });
 
+    // include recent short history
     for (const m of session.history.slice(-8)) {
       msgArr.push({ role: m.role, content: m.content });
     }
     msgArr.push({ role: 'user', content: userMsg });
 
-    const finalAnswer = await chatComplete(sys, msgArr);
+    // --- OpenAI completion ---
+    let finalAnswer = '';
+    try {
+      finalAnswer = await chatComplete(sys, msgArr);
+    } catch (e) {
+      // Last-resort friendly message
+      return res.json({
+        answer: lang === 'AR'
+          ? 'عذرًا، حدث خطأ أثناء توليد الإجابة. حاول مرة أخرى.'
+          : 'Sorry, something went wrong while generating the answer. Please try again.',
+        sources: [],
+        debug: { fatal: String(e.message || e) }
+      });
+    }
+
+    // Save assistant reply
     pushHistory(session, 'assistant', finalAnswer);
 
+    // Pin a topic after first good answer (helps follow-ups like “compare …”, “MCQs please”)
     if (!session.pinnedTopic) {
       const t = extractTopic(finalAnswer);
       if (t) session.pinnedTopic = t;
     }
 
-    return res.json({
+    // Pack sources (cleaned)
+    const sources = cleanSources(matches);
+
+    res.json({
       answer: finalAnswer,
-      sources: cleanSources(matches),
+      sources,
       debug: {
         lang, stage, subject,
         pinnedTopic: session.pinnedTopic || null,
-        pinecone: pineconeInfo
+        pinecone: { ok: matches.length > 0, note: pineconeNote }
       }
     });
-  } catch (err) {
-    // Last-resort safety: never crash the request
-    const msg = String(err?.message || err || 'Unknown error');
-    return res.status(200).json({
-      answer: 'Sorry, something went wrong while generating the answer. Please try again.',
+  } catch (e) {
+    // Never crash the request
+    res.status(200).json({
+      answer: 'Sorry, an unexpected error occurred. Please try again.',
       sources: [],
-      debug: { fatal: msg }
+      debug: { catch: String(e.message || e) }
     });
   }
 });
