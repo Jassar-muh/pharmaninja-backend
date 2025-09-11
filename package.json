@@ -1,24 +1,21 @@
 {
   "name": "pharmaninja-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "PharmaNinja backend (Express + OpenAI + Pinecone REST)",
+  "type": "module",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "@pinecone-database/pinecone": "^6.1.2",
-    "axios": "^1.11.0",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.2",
-    "express": "^5.1.0",
-    "fs": "^0.0.1-security",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
     "node-fetch": "^3.3.2",
-    "openai": "^5.16.0"
-  },
-  "type": "module"
+    "openai": "^4.58.1"
+  }
 }
